@@ -1,7 +1,114 @@
 language: node_js
-sudo: false
-node_js:
-- "0.10"
-- "0.12"
-- "4"
-- "5"
+
+# The node_js default caches node_modules between builds; a restored cache
+# would bypass the time-machine install below with stale/too-new packages.
+cache: false
+
+# Every leg is listed explicitly under jobs.include (an include list replaces
+# a top-level node_js matrix instead of adding to it).
+#
+# Dependencies come from a time-machine registry pinned to the 2.2.1 release
+# date (2016-02-22T19:12:09.116Z); the live registry now serves transitive
+# deps that no longer run on Node 0.10-5.
+
+# Helper scripts live in test/seal-ci/ (rationale in their header comments):
+#  - npm-setup.sh: makes left-pad@0.0.3 visible through the time machine.
+#  - container-leg.sh: the Node 0.10/0.12 legs, run in node:0.x containers
+#    for the jsdom@3 smoke tests.
+
+jobs:
+  include:
+    - name: "node 0.10 (node:0.10 container, jsdom@3 smoke tests)"
+      node_js: "0.10"
+      services:
+        - docker
+      before_install:
+        - npm config set registry "https://:2016-02-22T19%3A12%3A09.116Z@time-machines-npm.sealsecurity.io/"
+        - docker pull node:0.10
+      install: skip
+      script:
+        - >-
+          docker run --rm -v "$TRAVIS_BUILD_DIR":/work -w /work
+          node:0.10 bash test/seal-ci/container-leg.sh
+
+    - name: "node 0.12 (node:0.12 container, jsdom@3 smoke tests)"
+      node_js: "0.12"
+      services:
+        - docker
+      before_install:
+        - npm config set registry "https://:2016-02-22T19%3A12%3A09.116Z@time-machines-npm.sealsecurity.io/"
+        - docker pull node:0.12
+      install: skip
+      script:
+        - >-
+          docker run --rm -v "$TRAVIS_BUILD_DIR":/work -w /work
+          node:0.12 bash test/seal-ci/container-leg.sh
+
+    - name: "node 4"
+      node_js: "4"
+      before_install:
+        - npm config set registry "https://:2016-02-22T19%3A12%3A09.116Z@time-machines-npm.sealsecurity.io/"
+        - bash test/seal-ci/npm-setup.sh
+      install:
+        - npm install --cache-min=999999999
+      script:
+        - npm test
+
+    - name: "node 5"
+      node_js: "5"
+      before_install:
+        - npm config set registry "https://:2016-02-22T19%3A12%3A09.116Z@time-machines-npm.sealsecurity.io/"
+        - bash test/seal-ci/npm-setup.sh
+      install:
+        - npm install --cache-min=999999999
+      script:
+        - npm test
+
+    # The real unit suite (test/unit/*.js via test/index.html, QUnit 1.17.1)
+    # is browser-only; upstream ran it on TestSwarm. Build dist/ with Node 4,
+    # then drive the suite in headless Chrome from Node 20, served by PHP for
+    # the ajax fixtures (test/data/*.php).
+    - name: "QUnit unit suite (headless Chrome, dist built with node 4)"
+      node_js: "20"
+      addons:
+        chrome: stable
+      before_install:
+        - npm config set registry "https://:2016-02-22T19%3A12%3A09.116Z@time-machines-npm.sealsecurity.io/"
+        - nvm install 4
+        - nvm use 4
+        - bash test/seal-ci/npm-setup.sh
+      install:
+        - npm install --cache-min=999999999
+        # default task = build + lint + uglify + dist + node smoke tests + compare_size
+        - ./node_modules/.bin/grunt
+        - npm config delete registry
+        - nvm use 20
+        - node --version
+        # Driver lives outside the repo so npm 10 never touches jQuery's node_modules.
+        - mkdir -p /tmp/driver
+        - >-
+          cd /tmp/driver && npm init -y && npm install --registry=https://registry.npmjs.org/
+          puppeteer-core@24 && cd "$TRAVIS_BUILD_DIR"
+        - >-
+          if ! command -v php; then sudo apt-get update && sudo apt-get install -y php-cli; fi
+        - php --version
+        - google-chrome-stable --version
+      script:
+        # Several workers: single-process `php -S` serializes requests and
+        # starves the fixture iframes the suite opens.
+        - >-
+          PHP_CLI_SERVER_WORKERS=10 php -S 127.0.0.1:8000 -t . > /tmp/php.log 2>&1 &
+        - >-
+          for i in $(seq 1 30); do
+          if curl -sf -o /dev/null http://127.0.0.1:8000/test/index.html; then break; fi;
+          sleep 1; done;
+          curl -sf -o /dev/null http://127.0.0.1:8000/test/index.html
+        # Excluded (environment, not jQuery): "#14379 - jQuery.ajax() on unload"
+        # sends a synchronous XHR from an unload handler, which Chrome has
+        # refused during page dismissal since ~v80, so the request never
+        # reaches the server.
+        - >-
+          CHROME_PATH="$(command -v google-chrome-stable)"
+          NODE_PATH=/tmp/driver/node_modules
+          SEAL_SKIP_TESTS="ajax: #14379 - jQuery.ajax() on unload"
+          node test/seal-browser-runner.js "http://127.0.0.1:8000/test/index.html?dev"

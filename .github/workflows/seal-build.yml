@@ -1,0 +1,154 @@
+name: seal-build
+
+# Builds dist/ from source and packs the npm tarball exactly the way the
+# jQuery 2.2.1 release did. Tests run on Travis (.travis.yml), not here.
+on:
+  workflow_dispatch:
+
+jobs:
+  build-pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write container scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/seal" "$RUNNER_TEMP/out"
+          cat > "$RUNNER_TEMP/seal/build.sh" <<'SEAL_BUILD_EOF'
+          set -euo pipefail
+          # build/tasks/build.js appends $COMMIT to the embedded version string.
+          unset COMMIT
+          TM='https://:2016-02-22T19%3A12%3A09.116Z@time-machines-npm.sealsecurity.io/'
+          npm config set registry "$TM"
+          node --version
+          npm --version
+          # left-pad@0.0.3 is pinned exactly by grunt-jscs > jscs > babel-core@5 >
+          # line-numbers@0.2.0, but the registry dates it 2016-03-22 (it was
+          # restored after the March 2016 unpublish), so the 2016-02-22 time
+          # machine hides it. Add just that one version to the time machine's
+          # cached left-pad document and let npm use the cache (cache-min).
+          NPM_CACHE="$(npm config get cache)"
+          npm cache add --registry=https://registry.npmjs.org/ left-pad@0.0.3
+          npm view left-pad versions
+          node -e '
+          var fs = require("fs"), c = process.argv[1],
+            live = c + "/registry.npmjs.org/left-pad/.cache.json",
+            tm = c + "/time-machines-npm.sealsecurity.io/left-pad/.cache.json",
+            l = JSON.parse(fs.readFileSync(live, "utf8")),
+            t = JSON.parse(fs.readFileSync(tm, "utf8"));
+          t.versions["0.0.3"] = l.versions["0.0.3"];
+          fs.writeFileSync(tm, JSON.stringify(t));
+          console.log("left-pad versions now: " + Object.keys(t.versions).join(" "));
+          ' "$NPM_CACHE"
+          npm install --cache-min=999999999
+          # Pin the @DATE stamp to the 2.2.1 release value (dist/jquery.js header).
+          if ! grep -qF '( new Date() ).toISOString().replace( /:\d+\.\d+Z$/, "Z" )' build/tasks/build.js; then
+            echo "@DATE expression not found in build/tasks/build.js"
+            exit 1
+          fi
+          sed -i 's|( new Date() ).toISOString().replace( /:\\d+\\.\\d+Z$/, "Z" )|"2016-02-22T19:11Z"|' build/tasks/build.js
+          if ! grep -qF '.replace( /@DATE/g, "2016-02-22T19:11Z" )' build/tasks/build.js; then
+            echo "@DATE pin did not apply"
+            exit 1
+          fi
+          # = the `dev` task (build:*:* lint uglify remove_map_comment dist:*)
+          # minus lint, which Travis runs on every leg.
+          ./node_modules/.bin/grunt 'build:*:*' uglify remove_map_comment 'dist:*'
+          ls -la dist
+          chown -R "$HOST_UID:$HOST_GID" /work
+          SEAL_BUILD_EOF
+          cat > "$RUNNER_TEMP/seal/pack.sh" <<'SEAL_PACK_EOF'
+          set -euo pipefail
+          node --version
+          npm --version
+          # The published tarball's entries are uid/gid 501/20 (npm 2 keeps
+          # each file's owner in the tar entry).
+          chown -R 501:20 /pkg
+          cd /pkg
+          npm pack
+          mv jquery-2.2.1.tgz /out/
+          chown "$HOST_UID:$HOST_GID" /out/jquery-2.2.1.tgz
+          SEAL_PACK_EOF
+          chmod +x "$RUNNER_TEMP/seal/build.sh" "$RUNNER_TEMP/seal/pack.sh"
+
+      - name: Build dist (node 0.10 / npm 2, grunt)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/work \
+            -v "$RUNNER_TEMP/seal":/seal \
+            -w /work \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            node:0.10 bash /seal/build.sh
+
+      # dist/jquery.js, jquery.min.js and jquery.min.map are tracked at the
+      # tag; the build must regenerate them from src/ byte-for-byte. Sealed
+      # patches edit src/ only (dist/ is build output), so once src/ differs
+      # from the tag the rebuilt dist/ legitimately differs from the tracked
+      # copies: the byte-for-byte check applies only to the tag's src/ tree.
+      - name: Check rebuilt dist matches the tracked files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git status --short
+          git diff --stat -- dist/
+          # git tree id of src/ at the 2.2.1 tag
+          TAG_SRC_TREE=8cba23a6d8360118270e76a07871e2da8783c32a
+          if [ "$(git rev-parse HEAD:src)" = "$TAG_SRC_TREE" ]; then
+            git diff --exit-code -- dist/
+          else
+            echo "src/ differs from the 2.2.1 tag (sealed patches): dist/ rebuilt from the patched src/"
+          fi
+
+      # build/release/dist.js: the release commit of jquery-dist (tag 2.2.1)
+      # is master at the time (56ead6ff, "Release 1.12.1") plus copy(); npm
+      # publish ran from that tree. Its README.md and stale files stay.
+      - name: Assemble jquery-dist tree (build/release/dist.js copy step)
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$RUNNER_TEMP/jquery-dist"
+          git clone https://github.com/jquery/jquery-dist.git "$D"
+          git -C "$D" checkout 56ead6ffbf8560c521e7e94518d35db42b19f5f3
+          rm -rf "$D/.git"
+          mkdir -p "$D/dist"
+          cp -f dist/jquery.js dist/jquery.min.js dist/jquery.min.map "$D/dist/"
+          cp -rf src LICENSE.txt AUTHORS.txt package.json "$D/"
+          node -e '
+          var fs = require("fs"), d = process.argv[1],
+            pkg = JSON.parse(fs.readFileSync(d + "/package.json", "utf8"));
+          fs.writeFileSync(d + "/bower.json", JSON.stringify({
+            name: pkg.name,
+            main: pkg.main,
+            license: "MIT",
+            ignore: [ "package.json" ],
+            keywords: pkg.keywords
+          }, null, 2));
+          ' "$D"
+          find "$D" -type f | sort
+
+      - name: Pack (node 0.10 / npm 2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$RUNNER_TEMP/jquery-dist":/pkg \
+            -v "$RUNNER_TEMP/seal":/seal \
+            -v "$RUNNER_TEMP/out":/out \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            node:0.10 bash /seal/pack.sh
+          tar tzvf "$RUNNER_TEMP/out/jquery-2.2.1.tgz"
+          echo "entries: $(tar tzf "$RUNNER_TEMP/out/jquery-2.2.1.tgz" | wc -l)"
+          sha256sum "$RUNNER_TEMP/out/jquery-2.2.1.tgz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jquery-npm-tgz
+          path: ${{ runner.temp }}/out/jquery-2.2.1.tgz
+          if-no-files-found: error
