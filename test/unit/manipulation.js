@@ -2659,3 +2659,99 @@ QUnit.test( "Make sure col element is appended correctly", function( assert ) {
 
 	assert.strictEqual( table.find( "td" ).width(), 150 );
 } );
+
+QUnit.test( "<option> & <optgroup> HTML is not parsed in a <select> context (gh-4647)", function( assert ) {
+
+	var probe = document.createElement( "div" );
+
+	// Support: IE9
+	// IE9 drops <option> & <optgroup> outside of <select>, so it keeps the wrapper.
+	probe.innerHTML = "<option></option>";
+	if ( !probe.lastChild ) {
+		assert.expect( 1 );
+		assert.ok( true, "<select> wrapper still required in this browser" );
+		return;
+	}
+
+	assert.expect( 18 );
+
+	jQuery.each( [ "option", "optgroup" ], function( i, tag ) {
+
+		// When parsed inside a <select> wrapper, the closing </select> breaks
+		// out of it and jQuery only keeps the children of the trailing <b>.
+		var elems, div,
+			html = "<" + tag + ">a</" + tag + "></select><b>b</b>";
+
+		elems = jQuery( html );
+		assert.equal( elems.length, 2, "jQuery( html ): " + tag + " & b created" );
+		assert.ok( jQuery.nodeName( elems[ 0 ], tag ), "jQuery( html ): " + tag + " kept" );
+		assert.ok( jQuery.nodeName( elems[ 1 ], "b" ), "jQuery( html ): b kept" );
+
+		elems = jQuery.parseHTML( html );
+		assert.equal( elems.length, 2, "jQuery.parseHTML: " + tag + " & b created" );
+		assert.ok( jQuery.nodeName( elems[ 0 ], tag ), "jQuery.parseHTML: " + tag + " kept" );
+
+		div = jQuery( "<div/>" ).html( html );
+		assert.equal( div.children().length, 2, ".html(): " + tag + " & b inserted" );
+		assert.ok( jQuery.nodeName( div[ 0 ].firstChild, tag ), ".html(): " + tag + " kept" );
+
+		div = jQuery( "<div/>" ).append( html );
+		assert.equal( div.children().length, 2, ".append(): " + tag + " & b inserted" );
+		assert.ok( jQuery.nodeName( div[ 0 ].firstChild, tag ), ".append(): " + tag + " kept" );
+	} );
+} );
+
+QUnit.test( "Sanitized HTML with <option> doesn't get unsanitized (gh-4647)", function( assert ) {
+
+	var container, checks,
+		counter = 0,
+		done = assert.async();
+
+	assert.expect( 8 );
+
+	Globals.register( "xss" );
+	window.xss = sinon.spy();
+
+	container = jQuery( "<div></div>" );
+	container.appendTo( "#qunit-fixture" );
+
+	function test( htmlString, method ) {
+		var currCounter = counter,
+			div = jQuery( "<div></div>" );
+
+		counter++;
+
+		div.appendTo( container );
+		if ( method === "jQuery" ) {
+			div.append( jQuery( htmlString ) );
+		} else {
+			div[ method ]( htmlString );
+		}
+
+		// The would-be markup must stay inert text inside <style>
+		assert.ok( /onerror=xss/.test( div.find( "style" ).text() ),
+			"Markup kept inside <style>, " + method + ": " + htmlString );
+
+		return function() {
+			assert.ok( window.xss.withArgs( currCounter ).notCalled,
+				"Insecure code wasn't executed, " + method + ": " + htmlString );
+		};
+	}
+
+	// Note: below test cases need to invoke the xss function with consecutive
+	// decimal parameters for the assertion messages to be correct.
+	// Thanks to Masato Kinugawa from Cure53 for providing the following test case.
+	checks = [
+		test( "<option><style></option></select><img src=url404 onerror=xss(0)></style>", "html" ),
+		test( "<option><style></option></select><img src=url404 onerror=xss(1)></style>", "append" ),
+		test( "<option><style></option></select><img src=url404 onerror=xss(2)></style>", "jQuery" ),
+		test( "<optgroup><style></optgroup></select><img src=url404 onerror=xss(3)></style>", "html" )
+	];
+
+	setTimeout( function() {
+		jQuery.each( checks, function( i, check ) {
+			check();
+		} );
+		done();
+	}, 1000 );
+} );
